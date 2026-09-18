@@ -1,0 +1,14 @@
+# Secrets and transient state -- never commit these
+.env
+seen_ids.json.tmp
+seen_ids.corrupt-*.json
+.dry-run-unused.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs
+*.log
