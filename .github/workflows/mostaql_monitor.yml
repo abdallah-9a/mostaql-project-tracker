@@ -1,0 +1,72 @@
+name: Mostaql Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mostaql-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: Fetch new projects and notify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run offline test suite
+        run: python test_offline.py
+
+      - name: Run one monitor cycle
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          NOTIFY_ON_FIRST_RUN: "false"
+          LOG_LEVEL: INFO
+          PYTHONUNBUFFERED: "1"
+        run: python mostaql_notifier.py --once
+
+      - name: Persist seen_ids.json
+        if: always()
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ ! -f seen_ids.json ]; then
+            echo "No seen_ids.json produced; nothing to commit."
+            exit 0
+          fi
+
+          git add -- seen_ids.json
+          if git diff --cached --quiet -- seen_ids.json; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update seen_ids.json [skip ci]"
+          git pull --rebase --autostash origin "$BRANCH"
+          git push origin "HEAD:$BRANCH"
