@@ -2,8 +2,10 @@ name: Mostaql Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: '5,35 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [check-mostaql]
 
 permissions:
   contents: write
