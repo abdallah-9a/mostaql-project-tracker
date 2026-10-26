@@ -15,6 +15,7 @@ import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import mostaql_notifier as m
 
@@ -523,8 +524,10 @@ class SequenceSession:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.urls = []
 
     def get(self, url, **kwargs):
+        self.urls.append(url)
         self.calls.append(kwargs.get("headers", {}))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -551,7 +554,40 @@ check("fetch_projects_html returns listing HTML",
 check("fetch_projects_html uses LISTING_URL",
       listing_client.urls == [m.LISTING_URL], str(listing_client.urls))
 
-retry_client = m.HttpClient()
+direct_client = m.HttpClient(scraper_api_key="")
+direct_session = SequenceSession([FakeResponse(200)])
+direct_client.session = direct_session
+direct_client.get(m.LISTING_URL)
+check("missing API key falls back to direct fetch",
+      direct_session.urls == [m.LISTING_URL], str(direct_session.urls))
+
+with patch.dict(m.os.environ, {"SCRAPER_API_KEY": "env-test-key"}):
+    env_client = m.HttpClient()
+check("SCRAPER_API_KEY is detected from environment",
+      env_client.scraper_api_key == "env-test-key")
+
+with patch.dict(m.os.environ, {"SCRAPER_API_KEY": "   "}):
+    blank_client = m.HttpClient()
+check("blank SCRAPER_API_KEY falls back to direct fetch",
+      blank_client.scraper_api_key is None)
+
+proxy_client = m.HttpClient(scraper_api_key="test-api-key")
+proxy_session = SequenceSession([FakeResponse(200)])
+proxy_client.session = proxy_session
+proxy_body = proxy_client.get(m.LISTING_URL)
+check("ScraperAPI proxy returns body", proxy_body == "<html>ok</html>")
+proxy_url = proxy_session.urls[0]
+parsed_proxy = urlparse(proxy_url)
+proxy_params = parse_qs(parsed_proxy.query)
+check("ScraperAPI endpoint used",
+      f"{parsed_proxy.scheme}://{parsed_proxy.netloc}" == m.SCRAPER_API_URL,
+      proxy_url)
+check("ScraperAPI receives API key",
+      proxy_params.get("api_key") == ["test-api-key"], str(proxy_params))
+check("ScraperAPI receives encoded target URL",
+      proxy_params.get("url") == [m.LISTING_URL], str(proxy_params))
+
+retry_client = m.HttpClient(scraper_api_key="")
 retry_session = SequenceSession([
     FakeResponse(403), FakeResponse(403), FakeResponse(200),
 ])
@@ -567,7 +603,7 @@ check("403 waits 3s between retries", retry_sleeps == [3.0, 3.0],
 retry_uas = [h.get("User-Agent") for h in retry_session.calls]
 check("403 rotates user-agents", len(set(retry_uas)) == 3, str(retry_uas))
 
-exhaust_client = m.HttpClient()
+exhaust_client = m.HttpClient(scraper_api_key="")
 exhaust_session = SequenceSession([FakeResponse(403) for _ in range(3)])
 exhaust_client.session = exhaust_session
 exhaust_sleeps = []
@@ -585,7 +621,7 @@ check("403 exhaustion raises FetchError", "HTTP 403" in exhaust_error,
 check("403 exhaustion still slept twice", exhaust_sleeps == [3.0, 3.0],
       str(exhaust_sleeps))
 
-notfound_client = m.HttpClient()
+notfound_client = m.HttpClient(scraper_api_key="")
 notfound_session = SequenceSession([FakeResponse(404), FakeResponse(200)])
 notfound_client.session = notfound_session
 notfound_sleeps = []
@@ -594,6 +630,26 @@ with patch.object(m.time, "sleep", side_effect=notfound_sleeps.append):
 check("non-200 retry eventually returns body", notfound_body == "<html>ok</html>")
 check("non-200 retry waits 3s", notfound_sleeps == [3.0],
       str(notfound_sleeps))
+
+API_SECRET = "api-SECRET-123"
+fail_client = m.HttpClient(scraper_api_key=API_SECRET)
+fail_client.session = SequenceSession([
+    m.requests.ConnectionError(
+        f"Max retries exceeded for {m.SCRAPER_API_URL}"
+        f"?api_key={API_SECRET}&url=x"
+    )
+    for _ in range(m.MAX_ATTEMPTS)
+])
+redacted_error = ""
+try:
+    with patch.object(m.time, "sleep", return_value=None):
+        fail_client.get(m.LISTING_URL)
+except m.FetchError as exc:
+    redacted_error = str(exc)
+check("ScraperAPI key absent from fetch errors",
+      API_SECRET not in redacted_error, redacted_error)
+check("redacted fetch error still explains failure",
+      "Exhausted" in redacted_error, redacted_error)
 
 
 # ---------------------------------------------------------------------------

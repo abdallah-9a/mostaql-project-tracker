@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urlencode, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -170,6 +170,8 @@ DEFAULT_HEADERS = {
 
 HTTP_QUICK_RETRIES = 2
 HTTP_QUICK_RETRY_DELAY = 3.0
+
+SCRAPER_API_URL = "https://api.scraperapi.com"
 
 # ---------------------------------------------------------------------------
 # Keyword profile
@@ -482,12 +484,32 @@ _RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 522, 524})
 class HttpClient:
     """A requests.Session wrapper with coherent headers and retry/backoff."""
 
-    def __init__(self, headers: Optional[dict[str, str]] = None) -> None:
+    def __init__(
+        self,
+        headers: Optional[dict[str, str]] = None,
+        *,
+        scraper_api_key: Optional[str] = None,
+    ) -> None:
+        selected_key = (
+            scraper_api_key
+            if scraper_api_key is not None
+            else os.getenv("SCRAPER_API_KEY")
+        )
+        self.scraper_api_key = (selected_key or "").strip() or None
+
         self.session = requests.Session()
         self.base_headers = dict(DEFAULT_HEADERS)
         if headers:
             self.base_headers.update(headers)
         self.session.headers.update(self.base_headers)
+
+        if self.scraper_api_key:
+            # urllib3 DEBUG logs full request paths, exposing the key in the
+            # ScraperAPI query string. Keep those third-party logs at INFO.
+            logging.getLogger("urllib3").setLevel(logging.INFO)
+            log.info("ScraperAPI proxy enabled")
+        else:
+            log.debug("ScraperAPI proxy disabled (SCRAPER_API_KEY not set)")
 
     def close(self) -> None:
         try:
@@ -504,15 +526,16 @@ class HttpClient:
         profile. Raises FetchError (or CloudflareChallenge) when unusable.
         """
         last_error: Optional[Exception] = None
+        request_url = self._request_url(url)
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             request_headers = self._headers_for_attempt(attempt, referer)
             try:
                 response = self.session.get(
-                    url, timeout=REQUEST_TIMEOUT, headers=request_headers
+                    request_url, timeout=REQUEST_TIMEOUT, headers=request_headers
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
-                last_error = exc
+                last_error = FetchError(self._redact(exc))
                 delay = self._backoff_delay(attempt)
                 log.warning(
                     "Network error on %s (attempt %d/%d): %s -- retrying in %.1fs",
@@ -523,7 +546,9 @@ class HttpClient:
                 continue
             except requests.RequestException as exc:
                 # Malformed URL / too many redirects etc. -- not retryable.
-                raise FetchError(f"Request failed for {url}: {exc}") from exc
+                raise FetchError(
+                    f"Request failed for {url}: {self._redact(exc)}"
+                ) from exc
 
             if response.status_code in _RETRY_STATUS:
                 last_error = FetchError(f"HTTP {response.status_code}")
@@ -575,6 +600,24 @@ class HttpClient:
         raise FetchError(
             f"Exhausted {MAX_ATTEMPTS} attempts for {url}: {last_error}"
         )
+
+    def _request_url(self, url: str) -> str:
+        """Route through ScraperAPI when configured, otherwise fetch directly."""
+        if not self.scraper_api_key:
+            return url
+        query = urlencode({"api_key": self.scraper_api_key, "url": url})
+        return f"{SCRAPER_API_URL}?{query}"
+
+    def _redact(self, value: Any) -> str:
+        """Keep the ScraperAPI key out of logs and exception messages."""
+        text = str(value)
+        if self.scraper_api_key:
+            for secret in (
+                self.scraper_api_key,
+                quote_plus(self.scraper_api_key),
+            ):
+                text = text.replace(secret, "<REDACTED>")
+        return text
 
     def _headers_for_attempt(
         self, attempt: int, referer: Optional[str]

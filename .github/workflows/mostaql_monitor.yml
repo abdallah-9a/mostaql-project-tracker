@@ -44,6 +44,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
           NOTIFY_ON_FIRST_RUN: "false"
           LOG_LEVEL: INFO
           PYTHONUNBUFFERED: "1"
