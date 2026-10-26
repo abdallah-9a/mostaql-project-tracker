@@ -3,6 +3,7 @@
 seen_ids.json.tmp
 seen_ids.corrupt-*.json
 .dry-run-unused.json
+claude.txt
 
 # Python
 __pycache__/

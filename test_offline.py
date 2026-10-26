@@ -10,6 +10,7 @@ plus synthetic HTML for edge cases. No network, no Telegram, no credentials.
 """
 
 import json
+import logging
 import sys
 import tempfile
 from pathlib import Path
@@ -366,17 +367,34 @@ with tempfile.TemporaryDirectory() as td:
 
     # -- basic add/save/reload roundtrip
     s.add_many(["1", "2", "3"])
-    s.save()
+    check("changed save reports a write", s.save() is True)
     check("saved file exists", path.exists())
     check("3 ids stored", len(s) == 3)
 
     s2 = m.SeenStore(path)
     s2.load()
     check("reload restores ids", len(s2) == 3 and "2" in s2)
+    check("load leaves store clean", s2._dirty is False)
 
     # -- dedupe
     s2.add("1")
     check("duplicate add is a no-op", len(s2) == 3)
+
+    # -- no-op save must not rewrite the file (or bump updated_at)
+    before = path.read_text(encoding="utf-8")
+    check("no-op save reports no write", s2.save() is False)
+    check("no-op save leaves file untouched",
+          path.read_text(encoding="utf-8") == before)
+
+    # -- a genuinely new ID is persisted and clears the dirty flag
+    s2.add("4")
+    check("new id marks store dirty", s2._dirty is True)
+    check("new id save reports a write", s2.save() is True)
+    check("save clears dirty flag", s2._dirty is False)
+    s2b = m.SeenStore(path)
+    s2b.load()
+    check("new id survives reload", "4" in s2b and len(s2b) == 4)
+    check("loaded state is clean again", s2b.save() is False)
 
     # -- cap enforcement
     cap_store = m.SeenStore(path, cap=5)
@@ -458,6 +476,52 @@ check("send() reports success", dry.send("*hello* _world_") is True)
 check("send() records message", len(dry.sent) == 1)
 check("send(admin=True) works", dry.send("x", admin=True) is True)
 check("admin message recorded", len(dry.sent) == 2)
+
+
+# ---------------------------------------------------------------------------
+section("Telegram token redaction")
+
+TOKEN = "123456:TEST-SECRET-TOKEN"
+
+
+class FailingSession:
+    def get(self, *args, **kwargs):
+        raise m.requests.RequestException(
+            f"GET https://api.telegram.org/bot{TOKEN}/getMe failed"
+        )
+
+    def post(self, *args, **kwargs):
+        raise m.requests.RequestException(
+            f"POST https://api.telegram.org/bot{TOKEN}/sendMessage failed"
+        )
+
+
+log_messages: list[str] = []
+
+
+class CaptureLogs(logging.Handler):
+    def emit(self, record):
+        log_messages.append(record.getMessage())
+
+
+bot = m.TelegramNotifier(TOKEN, "chat")
+bot.session = FailingSession()
+capture = CaptureLogs()
+old_level = m.log.level
+m.log.addHandler(capture)
+m.log.setLevel(logging.DEBUG)
+try:
+    bot._post("chat", "hello", parse_mode=None)
+    bot.verify()
+finally:
+    m.log.removeHandler(capture)
+    m.log.setLevel(old_level)
+
+joined_logs = "\n".join(log_messages)
+check("raw bot token absent from logs", TOKEN not in joined_logs, joined_logs[:200])
+check("redaction marker present", m.REDACTED_TOKEN in joined_logs)
+check("redact_token helper replaces token",
+      m.redact_token(f"url /bot{TOKEN}/x", TOKEN) == "url /bot<REDACTED>/x")
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +649,35 @@ class FakeScraper:
                                duration="5 أيام", description="python backend api")
 
 
+class FailingNotifier:
+    """Always fails delivery, simulating a Telegram outage."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def send(self, text, *, admin=False):
+        self.attempts += 1
+        return False
+
+    def verify(self):
+        return True
+
+
+class FlakyNotifier(FailingNotifier):
+    """Fails the first delivery, then succeeds."""
+
+    def __init__(self):
+        super().__init__()
+        self.sent = []
+
+    def send(self, text, *, admin=False):
+        self.attempts += 1
+        if self.attempts == 1:
+            return False
+        self.sent.append(text)
+        return True
+
+
 def make_stub(pid, title="مشروع بايثون API"):
     return m.ProjectStub(project_id=pid, title=title,
                          url=f"https://mostaql.com/project/{pid}-x",
@@ -651,6 +744,62 @@ with tempfile.TemporaryDirectory() as td:
           scraper3.detail_calls == ["https://mostaql.com/project/3-x"],
           str(scraper3.detail_calls))
     check("new id persisted", "3" in store3)
+
+    # --- failed delivery keeps the ID unseen and marks the cycle unhealthy -
+    fail_state = Path(td) / "seen-delivery-fail.json"
+    store_fail = m.SeenStore(fail_state)
+    store_fail.load()
+    notifier_fail = FailingNotifier()
+    mon_fail = m.MostaqlMonitor(
+        FakeScraper([[make_stub("fail-1")]]), notifier_fail, store_fail,
+        notify_on_first_run=True, prime=False,
+    )
+    mon_fail._sleep = lambda: None
+    status_fail = mon_fail.run(max_cycles=1)
+    check("failed delivery is not marked seen", "fail-1" not in store_fail)
+    check("failed delivery leaves no state file", not fail_state.exists())
+    check("failed delivery reports unhealthy", status_fail == 1, str(status_fail))
+    check("failed delivery attempted once", notifier_fail.attempts == 1,
+          str(notifier_fail.attempts))
+
+    # --- the next cycle retries and persists only after delivery succeeds -
+    retry_state = Path(td) / "seen-delivery-retry.json"
+    store_retry = m.SeenStore(retry_state)
+    store_retry.load()
+    notifier_retry = FlakyNotifier()
+    mon_retry = m.MostaqlMonitor(
+        FakeScraper([[make_stub("retry-1")]]), notifier_retry, store_retry,
+        notify_on_first_run=True, prime=False,
+    )
+    mon_retry._sleep = lambda: None
+    status_retry = mon_retry.run(max_cycles=2)
+    check("failed delivery is retried next cycle", notifier_retry.attempts == 2,
+          str(notifier_retry.attempts))
+    check("successful retry is marked seen", "retry-1" in store_retry)
+    check("successful retry is persisted", retry_state.exists())
+    check("retry cycle ends healthy", status_retry == 0, str(status_retry))
+
+    # --- unmatched projects are still marked seen without an alert --------
+    unmatched_state = Path(td) / "seen-unmatched.json"
+    store_unmatched = m.SeenStore(unmatched_state)
+    store_unmatched.load()
+    notifier_unmatched = m.DryRunNotifier()
+    no_match_stub = m.ProjectStub(
+        project_id="unmatched-1", title="Logo design",
+        url="https://mostaql.com/project/unmatched-1-x",
+        brief="graphic design only", listing_bids=0,
+    )
+    mon_unmatched = m.MostaqlMonitor(
+        FakeScraper([[no_match_stub]]), notifier_unmatched, store_unmatched,
+        notify_on_first_run=True, prime=False,
+    )
+    mon_unmatched._sleep = lambda: None
+    status_unmatched = mon_unmatched.run(max_cycles=1)
+    check("unmatched project is marked seen", "unmatched-1" in store_unmatched)
+    check("unmatched project sends no alert", len(notifier_unmatched.sent) == 0,
+          str(len(notifier_unmatched.sent)))
+    check("unmatched cycle ends healthy", status_unmatched == 0,
+          str(status_unmatched))
 
     # --- already-seen NEWEST-first ordering: oldest alerted first ---------
     store4 = m.SeenStore(Path(td) / "seen4.json")
@@ -789,6 +938,60 @@ with tempfile.TemporaryDirectory() as td:
     persisted = m.SeenStore(cli_state)
     persisted.load()
     check("main(--once) persists seen_ids.json", "cli-77" in persisted)
+
+    # --- --once health checks: failures must surface as exit code 1 -------
+    for label, failure in (
+        ("fetch failure", m.FetchError("boom")),
+        ("Cloudflare block", m.CloudflareChallenge("blocked")),
+    ):
+        failure_state = Path(td) / f"cli-{label.replace(' ', '-')}.json"
+        with patch.object(m, "load_config",
+                          return_value=("token", "chat", None, False)), \
+                patch.object(m, "TelegramNotifier") as notifier_cls, \
+                patch.object(m, "MostaqlScraper") as scraper_cls, \
+                patch.object(m, "STATE_PATH", failure_state):
+            notifier_cls.return_value.verify.return_value = True
+            scraper_cls.return_value.fetch_listing.side_effect = failure
+            code = m.main(["--once"])
+            check(f"main(--once) exits 1 on {label}", code == 1, str(code))
+
+    empty_state = Path(td) / "cli-empty-dom.json"
+    with patch.object(m, "load_config",
+                      return_value=("token", "chat", None, False)), \
+            patch.object(m, "TelegramNotifier") as notifier_cls, \
+            patch.object(m, "MostaqlScraper") as scraper_cls, \
+            patch.object(m, "STATE_PATH", empty_state):
+        notifier_cls.return_value.verify.return_value = True
+        scraper_cls.return_value.fetch_listing.return_value = []
+        code = m.main(["--once"])
+        check("main(--once) exits 1 on empty DOM", code == 1, str(code))
+
+    send_fail_state = Path(td) / "cli-send-failure.json"
+    send_fail_seed = m.SeenStore(send_fail_state)
+    send_fail_seed.add("old-project")
+    send_fail_seed.save()
+
+    with patch.object(m, "load_config",
+                      return_value=("token", "chat", None, False)), \
+            patch.object(m, "TelegramNotifier") as notifier_cls, \
+            patch.object(m, "MostaqlScraper") as scraper_cls, \
+            patch.object(m, "STATE_PATH", send_fail_state):
+        notifier_cls.return_value.verify.return_value = True
+        notifier_cls.return_value.send.return_value = False
+        scraper_cls.return_value.fetch_listing.return_value = [
+            make_stub("send-fail-1")
+        ]
+        scraper_cls.return_value.fetch_detail.return_value = m.ProjectDetail(
+            hire_rate=60.0, bids=2, open_projects=1,
+            budget_raw="$500 - $1000", budget_max=1000.0,
+            duration="5 أيام", description="python backend api",
+        )
+        code = m.main(["--once"])
+        check("main(--once) exits 1 on delivery failure", code == 1, str(code))
+
+    send_fail_persisted = m.SeenStore(send_fail_state)
+    send_fail_persisted.load()
+    check("delivery failure is not persisted", "send-fail-1" not in send_fail_persisted)
 
 
 # ---------------------------------------------------------------------------

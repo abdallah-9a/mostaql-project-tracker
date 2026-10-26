@@ -43,7 +43,7 @@ python mostaql_notifier.py                   # run the monitor
 |---|---|
 | `python mostaql_notifier.py` | Poll forever (75–90 s jittered). Ctrl-C to stop cleanly. |
 | `--dry-run` | Print alerts to stdout. Needs **no** `.env`, ignores saved state so every current match is shown, and never writes state. **Start here.** |
-| `--once` | A single cycle, then exit — for cron / Task Scheduler. |
+| `--once` | A single cycle, then exit — for cron / Task Scheduler. Exits non-zero on fetch, DOM, or delivery failure. |
 | `--test-telegram` | Send one test message and exit. |
 | `--notify-on-first-run` | Also alert on the projects already listed at startup (see below). |
 
@@ -118,7 +118,7 @@ things:
 
 | Concern | Handling |
 |---|---|
-| State survives restarts | `seen_ids.json`, written atomically (temp file + `os.replace`) |
+| State survives restarts | `seen_ids.json`, written atomically (temp file + `os.replace`); no-op saves are skipped |
 | Unbounded file growth | Capped at the newest **1000** IDs, oldest evicted |
 | Missing / corrupt state | Missing → starts fresh. Corrupt → quarantined to `seen_ids.json.corrupt-<ts>` and starts fresh; never crashes |
 | Network failures | 4 attempts, exponential backoff with full jitter, capped at 60 s |
@@ -198,16 +198,17 @@ User=mostaql
 WantedBy=multi-user.target
 ```
 
-**Prefer `--once` on a scheduler?** It works, but you lose the in-process
-backoff and the consecutive-empty-cycle watchdog is reset each run — the
-long-running mode is better at detecting layout breakage.
+**Prefer `--once` on a scheduler?** It works, and a failed/empty/undeliverable
+cycle now exits non-zero so CI surfaces the problem. The multi-cycle
+empty-DOM watchdog still only operates in long-running mode.
 
-**GitHub Actions (every 5 minutes):** `.github/workflows/mostaql_monitor.yml`
-runs the offline test suite, executes `python mostaql_notifier.py --once`, and
-commits the updated `seen_ids.json` back to the branch as
-`github-actions[bot]`. Add `BOT_TOKEN` and `CHAT_ID` (and optionally
-`ADMIN_CHAT_ID`) under **Settings → Secrets and variables → Actions**.
-`seen_ids.json` is intentionally tracked so state survives between runs.
+**GitHub Actions (every 15 minutes, cron `*/15 * * * *`):**
+`.github/workflows/mostaql_monitor.yml` runs the offline test suite, executes
+`python mostaql_notifier.py --once`, and commits the updated `seen_ids.json`
+back to the branch as `github-actions[bot]`. Add `BOT_TOKEN` and `CHAT_ID`
+(and optionally `ADMIN_CHAT_ID`) under
+**Settings → Secrets and variables → Actions**. `seen_ids.json` is
+intentionally tracked so state survives between runs.
 
 ---
 
@@ -217,7 +218,7 @@ commits the updated `seen_ids.json` back to the branch as
 python test_offline.py
 ```
 
-223 assertions, no network and no credentials. Runs against the saved live
+251 assertions, no network and no credentials. Runs against the saved live
 fixtures (`listing.html`, `detail.html`, `detail2.html`) plus synthetic HTML and
 stub scrapers. Covers the parser, keyword false-positive guards (the `robot`/
 `restaurant` cases), budget/number parsing, MarkdownV2 escaping **and a

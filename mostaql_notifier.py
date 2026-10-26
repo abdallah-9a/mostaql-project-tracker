@@ -54,6 +54,16 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
+# Paths & environment
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+
+# Load .env before logging is configured so LOG_LEVEL from the file is honoured.
+load_dotenv(ENV_PATH)
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -71,8 +81,6 @@ log = logging.getLogger("monitor")
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
 STATE_PATH = BASE_DIR / "seen_ids.json"
 
 LISTING_URL = "https://mostaql.com/projects?category=development"
@@ -964,6 +972,7 @@ class SeenStore:
         self.cap = cap
         self._ids: list[str] = []           # insertion-ordered, oldest first
         self._set: set[str] = set()
+        self._dirty = False                 # True when IDs changed since last save
 
     # -- I/O ---------------------------------------------------------------
 
@@ -999,12 +1008,23 @@ class SeenStore:
 
         for item in raw_ids:
             if isinstance(item, (str, int)):
-                self._add_in_memory(str(item))
+                self._add_in_memory(str(item), mark_dirty=False)
 
+        self._dirty = False
         log.info("Loaded %d seen project IDs", len(self._ids))
 
-    def save(self) -> None:
-        """Atomically persist the current ID set (temp file + replace)."""
+    def save(self) -> bool:
+        """
+        Atomically persist state only when the ID set has changed.
+
+        Returns True when the file was rewritten, False for a no-op or a write
+        failure. Keeping no-op saves off disk prevents empty GitHub Actions
+        state commits.
+        """
+        if not self._dirty:
+            log.debug("State unchanged -- skipping save")
+            return False
+
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "count": len(self._ids),
@@ -1021,6 +1041,10 @@ class SeenStore:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            return False
+
+        self._dirty = False
+        return True
 
     # -- queries -----------------------------------------------------------
 
@@ -1043,10 +1067,10 @@ class SeenStore:
         for project_id in project_ids:
             self._add_in_memory(project_id)
 
-    def _add_in_memory(self, project_id: str) -> None:
+    def _add_in_memory(self, project_id: str, *, mark_dirty: bool = True) -> bool:
         """Insert an ID, evicting the oldest entries beyond the cap."""
         if not project_id or project_id in self._set:
-            return
+            return False
         self._ids.append(project_id)
         self._set.add(project_id)
 
@@ -1056,10 +1080,25 @@ class SeenStore:
                 self._set.discard(evicted)
             del self._ids[:overflow]
 
+        if mark_dirty:
+            self._dirty = True
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
+
+REDACTED_TOKEN = "<REDACTED>"
+
+
+def redact_token(value: Any, token: str) -> str:
+    """Replace a bot token in exception/URL text before it reaches a log."""
+    text = str(value)
+    if token:
+        text = text.replace(token, REDACTED_TOKEN)
+    return text
+
 
 class DryRunNotifier:
     """
@@ -1139,7 +1178,10 @@ class TelegramNotifier:
                     time.sleep(delay)
                 continue
             except requests.RequestException as exc:
-                log.error("Telegram request failed: %s", exc)
+                log.error(
+                    "Telegram request failed: %s",
+                    redact_token(exc, self.token),
+                )
                 return False
 
             if response.status_code == 200:
@@ -1186,7 +1228,10 @@ class TelegramNotifier:
         try:
             response = self.session.get(url, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
-            log.error("Telegram unreachable: %s", exc)
+            log.error(
+                "Telegram unreachable: %s",
+                redact_token(exc, self.token),
+            )
             return False
         if response.status_code != 200:
             log.error("Telegram rejected the bot token: HTTP %d", response.status_code)
@@ -1360,14 +1405,17 @@ class MostaqlMonitor:
                 # Not available on every platform/thread context.
                 pass
 
-    def run(self, max_cycles: Optional[int] = None) -> None:
+    def run(self, max_cycles: Optional[int] = None) -> int:
         """
         Poll until signalled (or until `max_cycles` completes, for --once).
 
-        Notifies on new projects matching the keyword profile.
+        Notifies on new projects matching the keyword profile. Returns 0 when
+        the final requested cycle completed healthily, 1 otherwise (used by
+        --once to fail the GitHub Actions job on fetch/DOM/delivery errors).
         """
         empty_cycles = 0
         cycle = 0
+        last_cycle_ok = True
         primed = (not self.store.is_empty) or (not self.prime)
 
         log.info(
@@ -1387,6 +1435,7 @@ class MostaqlMonitor:
                 projects = self.scraper.fetch_listing()
             except FetchError as exc:
                 log.error("Listing fetch failed: %s", exc)
+                last_cycle_ok = False
                 if max_cycles is not None and cycle >= max_cycles:
                     break
                 self._sleep()
@@ -1399,6 +1448,7 @@ class MostaqlMonitor:
                     "Listing returned 0 projects (streak: %d/%d)",
                     empty_cycles, EMPTY_CYCLE_ALERT_THRESHOLD,
                 )
+                last_cycle_ok = False
                 if empty_cycles >= EMPTY_CYCLE_ALERT_THRESHOLD and (
                     (empty_cycles - EMPTY_CYCLE_ALERT_THRESHOLD)
                     % EMPTY_ALERT_REPEAT_EVERY
@@ -1411,6 +1461,7 @@ class MostaqlMonitor:
                 continue
 
             empty_cycles = 0
+            last_cycle_ok = True
 
             # ---- first-run priming --------------------------------------
             # Without this, a cold start would replay every project currently
@@ -1440,17 +1491,26 @@ class MostaqlMonitor:
                 "Fetched %d projects | %d new", len(projects), len(new_projects)
             )
 
+            delivery_failures = 0
             for stub in reversed(new_projects):     # listing is newest-first
                 if self._stopping:
                     break
                 try:
-                    self._process(stub)
+                    if not self._process(stub):
+                        delivery_failures += 1
                 except Exception:
                     # One bad project must never kill the loop.
                     log.exception("Unhandled error processing %s", stub.url)
+                    delivery_failures += 1
 
-            # Record everything we saw, matched or not.
-            self.store.add_many(p.project_id for p in projects)
+            if delivery_failures:
+                last_cycle_ok = False
+                log.warning(
+                    "%d project(s) were not marked seen and will be retried",
+                    delivery_failures,
+                )
+
+            # Persist only IDs that were actually recorded by _process().
             self._save()
 
             log.info(
@@ -1465,6 +1525,7 @@ class MostaqlMonitor:
 
         self._save()
         log.info("Monitor stopped cleanly | seen=%d", len(self.store))
+        return 0 if last_cycle_ok else 1
 
     def _save(self) -> None:
         """Persist state, unless running in a non-persisting (dry-run) mode."""
@@ -1473,12 +1534,19 @@ class MostaqlMonitor:
 
     # -- per-project handling ---------------------------------------------
 
-    def _process(self, stub: ProjectStub) -> None:
-        """Match, enrich and notify for a single new project."""
+    def _process(self, stub: ProjectStub) -> bool:
+        """
+        Match, enrich and notify for a single new project.
+
+        Returns True when the project can be marked seen. A project is only
+        recorded after a successful Telegram delivery, so failed alerts are
+        retried on the next cycle instead of being silently dropped.
+        """
         matched = match_keywords(stub.searchable_text)
         if not matched:
             log.debug("Skip (no keyword match): %s", stub.title)
-            return
+            self.store.add(stub.project_id)
+            return True
 
         stub.matched_keywords = matched
         log.info("MATCH [%s] %s", ", ".join(matched), stub.title)
@@ -1490,11 +1558,21 @@ class MostaqlMonitor:
         verdict = assess(stub, detail)
         log.info("  -> %s %s (%s)", verdict.badge, verdict.label, verdict.reason)
 
-        self.notifier.send(format_alert(stub, detail, verdict))
+        delivered = self.notifier.send(format_alert(stub, detail, verdict))
+        if delivered:
+            self.store.add(stub.project_id)
+            self._save()
+        else:
+            log.warning(
+                "Delivery failed for %s -- keeping it unseen for retry",
+                stub.project_id,
+            )
 
         # Politeness pause between detail-page hits.
         if DETAIL_FETCH_DELAY > 0:
             time.sleep(DETAIL_FETCH_DELAY)
+
+        return delivered
 
     def _sleep(self) -> None:
         """Sleep a jittered interval, waking early if shutdown is requested."""
@@ -1511,12 +1589,10 @@ class MostaqlMonitor:
 
 def load_config() -> tuple[str, str, Optional[str], bool]:
     """
-    Load and validate secrets from .env.
+    Load and validate secrets from the already-loaded environment.
 
     Exits with a clear message rather than starting a bot that cannot notify.
     """
-    load_dotenv(ENV_PATH)
-
     token = (os.getenv("BOT_TOKEN") or "").strip()
     chat_id = (os.getenv("CHAT_ID") or "").strip()
     admin_chat_id = (os.getenv("ADMIN_CHAT_ID") or "").strip() or None
@@ -1595,8 +1671,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 persist=False,
                 prime=False,                   # treat everything as new
             )
-            monitor.run(max_cycles=1)
-            return 0
+            return monitor.run(max_cycles=1)
 
         token, chat_id, admin_chat_id, notify_on_first_run = load_config()
         if args.notify_on_first_run:
@@ -1619,7 +1694,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             scraper, notifier, store, notify_on_first_run=notify_on_first_run
         )
         monitor.install_signal_handlers()
-        monitor.run(max_cycles=1 if args.once else None)
+        status = monitor.run(max_cycles=1 if args.once else None)
+        if args.once:
+            if status:
+                log.error("Single-cycle run failed -- exiting non-zero for CI")
+            return status
         return 0
     finally:
         client.close()
