@@ -14,6 +14,7 @@ import logging
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import mostaql_notifier as m
 
@@ -479,6 +480,123 @@ check("admin message recorded", len(dry.sent) == 2)
 
 
 # ---------------------------------------------------------------------------
+section("HTTP client: browser headers and WAF retry")
+
+EXPECTED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Sec-Ch-Ua": (
+        '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"'
+    ),
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+for name, expected in EXPECTED_HEADERS.items():
+    check(f"default header {name}", m.DEFAULT_HEADERS.get(name) == expected,
+          repr(m.DEFAULT_HEADERS.get(name)))
+
+check("multiple browser profiles", len(m.BROWSER_PROFILES) >= 3)
+check("profiles have distinct user-agents",
+      len({p["User-Agent"] for p in m.BROWSER_PROFILES})
+      == len(m.BROWSER_PROFILES))
+
+
+class FakeResponse:
+    def __init__(self, status_code, text="<html>ok</html>", headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+
+class SequenceSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(kwargs.get("headers", {}))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self):
+        pass
+
+
+class ListingClient:
+    def __init__(self):
+        self.urls = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return "<html><body>listing</body></html>"
+
+
+listing_client = ListingClient()
+scraper = m.MostaqlScraper(listing_client)
+check("fetch_projects_html returns listing HTML",
+      scraper.fetch_projects_html() == "<html><body>listing</body></html>")
+check("fetch_projects_html uses LISTING_URL",
+      listing_client.urls == [m.LISTING_URL], str(listing_client.urls))
+
+retry_client = m.HttpClient()
+retry_session = SequenceSession([
+    FakeResponse(403), FakeResponse(403), FakeResponse(200),
+])
+retry_client.session = retry_session
+retry_sleeps = []
+with patch.object(m.time, "sleep", side_effect=retry_sleeps.append):
+    retry_body = retry_client.get(m.LISTING_URL)
+check("403 retry eventually returns body", retry_body == "<html>ok</html>")
+check("403 uses two retries", len(retry_session.calls) == 3,
+      str(len(retry_session.calls)))
+check("403 waits 3s between retries", retry_sleeps == [3.0, 3.0],
+      str(retry_sleeps))
+retry_uas = [h.get("User-Agent") for h in retry_session.calls]
+check("403 rotates user-agents", len(set(retry_uas)) == 3, str(retry_uas))
+
+exhaust_client = m.HttpClient()
+exhaust_session = SequenceSession([FakeResponse(403) for _ in range(3)])
+exhaust_client.session = exhaust_session
+exhaust_sleeps = []
+try:
+    with patch.object(m.time, "sleep", side_effect=exhaust_sleeps.append):
+        exhaust_client.get(m.LISTING_URL)
+except m.FetchError as exc:
+    exhaust_error = str(exc)
+else:
+    exhaust_error = ""
+check("403 stops after two retries", len(exhaust_session.calls) == 3,
+      str(len(exhaust_session.calls)))
+check("403 exhaustion raises FetchError", "HTTP 403" in exhaust_error,
+      exhaust_error)
+check("403 exhaustion still slept twice", exhaust_sleeps == [3.0, 3.0],
+      str(exhaust_sleeps))
+
+notfound_client = m.HttpClient()
+notfound_session = SequenceSession([FakeResponse(404), FakeResponse(200)])
+notfound_client.session = notfound_session
+notfound_sleeps = []
+with patch.object(m.time, "sleep", side_effect=notfound_sleeps.append):
+    notfound_body = notfound_client.get(m.LISTING_URL)
+check("non-200 retry eventually returns body", notfound_body == "<html>ok</html>")
+check("non-200 retry waits 3s", notfound_sleeps == [3.0],
+      str(notfound_sleeps))
+
+
+# ---------------------------------------------------------------------------
 section("Telegram token redaction")
 
 TOKEN = "123456:TEST-SECRET-TOKEN"
@@ -904,8 +1022,6 @@ with tempfile.TemporaryDirectory() as td:
     check("--once exits after a failed fetch without idling", not slept)
 
     # --- --once end-to-end through main(), with network/Telegram stubbed ---
-    from unittest.mock import patch
-
     cli_state = Path(td) / "cli-once.json"
     seed = m.SeenStore(cli_state)
     seed.add("old-project")

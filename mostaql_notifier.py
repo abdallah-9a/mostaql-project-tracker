@@ -119,17 +119,46 @@ SCOPE_WORD_COUNT = 120          # brief word count that counts as "large scope"
 # header profile avoids the most common bot heuristics. Note: we deliberately
 # advertise only gzip/deflate, because requests cannot decode Brotli unless the
 # optional `brotli` package is installed.
+BROWSER_PROFILES: tuple[dict[str, str], ...] = (
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+        ),
+        "Sec-Ch-Ua": (
+            '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"'
+        ),
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Sec-Ch-Ua": (
+            '"Google Chrome";v="130", "Not=A?Brand";v="8", "Chromium";v="130"'
+        ),
+    },
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Sec-Ch-Ua": (
+            '"Google Chrome";v="131", "Not=A?Brand";v="8", "Chromium";v="131"'
+        ),
+    },
+)
+
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    ),
+    **BROWSER_PROFILES[0],
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate",
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
@@ -138,6 +167,9 @@ DEFAULT_HEADERS = {
     "Cache-Control": "max-age=0",
     "Connection": "keep-alive",
 }
+
+HTTP_QUICK_RETRIES = 2
+HTTP_QUICK_RETRY_DELAY = 3.0
 
 # ---------------------------------------------------------------------------
 # Keyword profile
@@ -452,7 +484,10 @@ class HttpClient:
 
     def __init__(self, headers: Optional[dict[str, str]] = None) -> None:
         self.session = requests.Session()
-        self.session.headers.update(headers or DEFAULT_HEADERS)
+        self.base_headers = dict(DEFAULT_HEADERS)
+        if headers:
+            self.base_headers.update(headers)
+        self.session.headers.update(self.base_headers)
 
     def close(self) -> None:
         try:
@@ -464,16 +499,17 @@ class HttpClient:
         """
         GET `url` and return decoded HTML.
 
-        Retries transient failures with exponential backoff + jitter. Raises
-        FetchError (or CloudflareChallenge) when the content is unusable.
+        Retries transient failures with exponential backoff + jitter. A 403 or
+        other non-200 gets two quick retries (3s apart) with a rotated browser
+        profile. Raises FetchError (or CloudflareChallenge) when unusable.
         """
-        headers = {"Referer": referer} if referer else None
         last_error: Optional[Exception] = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            request_headers = self._headers_for_attempt(attempt, referer)
             try:
                 response = self.session.get(
-                    url, timeout=REQUEST_TIMEOUT, headers=headers
+                    url, timeout=REQUEST_TIMEOUT, headers=request_headers
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_error = exc
@@ -506,8 +542,22 @@ class HttpClient:
                     time.sleep(delay)
                 continue
 
-            if response.status_code >= 400:
-                raise FetchError(f"HTTP {response.status_code} for {url}")
+            if response.status_code != 200:
+                last_error = FetchError(
+                    f"HTTP {response.status_code} for {url}"
+                )
+                # WAF/edge blocks are often UA-specific. Retry quickly with the
+                # next coherent browser profile before giving up.
+                if attempt <= HTTP_QUICK_RETRIES:
+                    log.warning(
+                        "HTTP %d on %s (attempt %d/%d) -- retrying with a "
+                        "rotated browser profile in %.1fs",
+                        response.status_code, url, attempt, MAX_ATTEMPTS,
+                        HTTP_QUICK_RETRY_DELAY,
+                    )
+                    time.sleep(HTTP_QUICK_RETRY_DELAY)
+                    continue
+                raise last_error
 
             body = response.text
 
@@ -525,6 +575,18 @@ class HttpClient:
         raise FetchError(
             f"Exhausted {MAX_ATTEMPTS} attempts for {url}: {last_error}"
         )
+
+    def _headers_for_attempt(
+        self, attempt: int, referer: Optional[str]
+    ) -> dict[str, str]:
+        """Return coherent browser headers, rotating the profile per attempt."""
+        profile = BROWSER_PROFILES[(attempt - 1) % len(BROWSER_PROFILES)]
+        headers = dict(self.base_headers)
+        headers.update(profile)
+        if referer:
+            headers["Referer"] = referer
+            headers["Sec-Fetch-Site"] = "same-origin"
+        return headers
 
     @staticmethod
     def _backoff_delay(attempt: int) -> float:
@@ -650,10 +712,13 @@ class MostaqlScraper:
 
     # -- listing -----------------------------------------------------------
 
+    def fetch_projects_html(self) -> str:
+        """Fetch the listing HTML with browser headers and WAF retries."""
+        return self.client.get(LISTING_URL)
+
     def fetch_listing(self) -> list[ProjectStub]:
         """Fetch and parse the newest page of the development category."""
-        html = self.client.get(LISTING_URL)
-        return self.parse_listing(html)
+        return self.parse_listing(self.fetch_projects_html())
 
     @staticmethod
     def parse_listing(html: str) -> list[ProjectStub]:
